@@ -1,0 +1,9 @@
+target/
+.idea/
+.bsp/
+*.json
+*.class
+*.jar
+*.tasty
+*.log
+*.bin
