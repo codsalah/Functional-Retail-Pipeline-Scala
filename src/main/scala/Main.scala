@@ -104,14 +104,23 @@ object Main {
       }.toEither.left.map(_.getMessage)
     
     // 2. Database Operations
-    def saveToDB(order: ProcessedOrder): Either[String, Unit] =
+    def saveToDB(po: ProcessedOrder): Either[String, Unit] =
       Try {
-        // Functional simulation of DB load
-        logger("INFO", s"Saving order to DB: ${order.order.productName} | Final Price: ${order.finalPrice}")
-        println(s"Successfully processed and saved: ${order.order.productName}")
-        println("------------------------------------------------------")
+        val path = Paths.get("ProcessedOrders.csv")
+        // Create file with header if it doesn't exist
+        if (!Files.exists(path)) {
+          val header = "timestamp,product_name,discount,final_price\n"
+          Files.write(path, header.getBytes, StandardOpenOption.CREATE)
+        }
+        
+        val row = s"${po.processedAt},${po.order.productName},${po.discount},${po.finalPrice}\n"
+        Files.write(path, row.getBytes, StandardOpenOption.APPEND)
+        
+        // Use .foreach or a match to execute the side-effect without changing the return type
+        logger("INFO", s"Successfully saved to ProcessedOrders: ${po.order.productName}")
+        () // Return Unit to ensure the type is Either[String, Unit]
       }.toEither.left.map(_.getMessage)
-
+          
     // 3. File I/O (Read CSV, Process)
     def processFile(filePath: String): Either[String, Unit] =
       Try {
@@ -150,11 +159,6 @@ object Main {
         }
       }.toEither.left.map(_.getMessage)
 
-    // // line count before and after processing
-    // val lineCountBefore: Either[String, Long] =
-    //   Try(Files.lines(Paths.get("src/main/resources/TRX1000.csv")).count())
-    //     .toEither.left.map(_.getMessage)
-
     // Execution trigger
     val fileName = "src/main/resources/TRX1000.csv" 
     // Used Either Left/Right for error handling
@@ -163,17 +167,8 @@ object Main {
       case Left(e)  => logger("ERROR", s"Critical failure: $e")
     }
 
-    // val lineCountAfter: Either[String, Long] =
-    //   Try(Files.lines(Paths.get("rules_engine.log")).count())
-    //     .toEither.left.map(_.getMessage)
-
-    // // Line count before and after processing
-    // (lineCountBefore, lineCountAfter) match {
-    //   case (Right(before), Right(after)) =>
-    //     if (before == after) println(s"Same line count. with ($before lines, $after lines)")
-    //     else println(s"Different line count. with ($before lines, $after lines)")
-    //   case (Left(err), _) => println(s"Could not read CSV for line count: $err")
-    //   case (_, Left(err)) => println(s"Could not read log for line count: $err")
-    // }
+    val lineCountAfter: Either[String, Long] =
+      Try(Files.lines(Paths.get("rules_engine.log")).count())
+        .toEither.left.map(_.getMessage)
   }
 }
