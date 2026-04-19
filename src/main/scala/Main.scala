@@ -1,9 +1,12 @@
+//> using dep org.xerial:sqlite-jdbc:3.53.0.0
 import java.time.{LocalDate, LocalDateTime}
+
+
 import java.time.temporal.ChronoUnit
 import java.nio.file.{Files, Paths, StandardOpenOption}
+import java.sql.{Connection, DriverManager, PreparedStatement}
 import scala.util.{Try, Success, Failure}
 import scala.io.Source
-
 // The Data models
 case class Order(
   transactionDate: LocalDate,
@@ -14,14 +17,12 @@ case class Order(
   channel: String,     
   paymentMethod: String
 )
-
 case class ProcessedOrder(
   order: Order,
   discount: Double,
   finalPrice: Double,
   processedAt: LocalDateTime = LocalDateTime.now()
 )
-
 // The Rule Engine (Pure Functions)
 object RuleEngine {
   type DiscountRule = Order => Double
@@ -32,7 +33,6 @@ object RuleEngine {
     if (daysRemaining < 30 && daysRemaining > 0) (30 - daysRemaining) * 0.01 
     else 0.0
   }
-
   // Rule: Category logic (Cheese 10%, Wine 5%)
   val saleRule: DiscountRule = order => {
     order.productName.toLowerCase match {
@@ -59,7 +59,6 @@ object RuleEngine {
       case _ => 0.0
     }
   }    
-
   // Vector of all rules 
   val rules: Vector[DiscountRule] = Vector(
     expiryRule,
@@ -69,13 +68,11 @@ object RuleEngine {
   )
   
   def calculateDiscount(order: Order): Double = {
-
     // Calculate the average of the top two discounts (separating discounts from averaging)
     val appliedDiscounts = rules
       .map(rule => rule(order))
       .filter(_ > 0)
       .sortBy(-_)
-
     // Calculate the final discount (The result of this match is returned by the function)
     appliedDiscounts.take(2) match {
       case results if results.isEmpty => 0.0
@@ -83,7 +80,6 @@ object RuleEngine {
     }
   }
 }
-
 // The Main Application
 object Main {
   def main(args: Array[String]): Unit = {
@@ -103,32 +99,49 @@ object Main {
         () 
       }.toEither.left.map(_.getMessage)
     
-    // 2. Database Operations
-    def saveToDB(po: ProcessedOrder): Either[String, Unit] =
+    // 2. Database Operations (SQLite)
+    def saveToDB(po: ProcessedOrder, conn: Connection): Either[String, Unit] =
       Try {
-        val path = Paths.get("ProcessedOrders.csv")
-        // Create file with header if it doesn't exist
-        if (!Files.exists(path)) {
-          val header = "timestamp,product_name,discount,final_price\n"
-          Files.write(path, header.getBytes, StandardOpenOption.CREATE)
-        }
-        
-        val row = s"${po.processedAt},${po.order.productName},${po.discount},${po.finalPrice}\n"
-        Files.write(path, row.getBytes, StandardOpenOption.APPEND)
-        
+        val sql = "INSERT INTO processed_orders (timestamp, product_name, discount, final_price) VALUES (?, ?, ?, ?)"
+        val stmt: PreparedStatement = conn.prepareStatement(sql)
+        stmt.setString(1, po.processedAt.toString)
+        stmt.setString(2, po.order.productName)
+        stmt.setDouble(3, po.discount)
+        stmt.setDouble(4, po.finalPrice)
+        stmt.executeUpdate()
+        stmt.close()
+
         // Use .foreach or a match to execute the side-effect without changing the return type
         logger("INFO", s"Successfully saved to ProcessedOrders: ${po.order.productName}")
         () // Return Unit to ensure the type is Either[String, Unit]
       }.toEither.left.map(_.getMessage)
+
+    // Helper to initialise the DB and create the table if it doesn't exist
+    def initDB(): Either[String, Connection] =
+      Try {
+        val conn = DriverManager.getConnection("jdbc:sqlite:processed_orders.db")
+        val stmt = conn.createStatement()
+        stmt.execute(
+          """CREATE TABLE IF NOT EXISTS processed_orders (
+            |  timestamp    TEXT,
+            |  product_name TEXT,
+            |  discount     REAL,
+            |  final_price  REAL
+            |)""".stripMargin
+        )
+        stmt.close()
+        conn
+      }.toEither.left.map(_.getMessage)
           
     // 3. File I/O (Read CSV, Process)
-    def processFile(filePath: String): Either[String, Unit] =
+    def processFile(filePath: String, conn: Connection): Either[String, Unit] =
       Try {
         val source = Source.fromFile(filePath)
         
         // Ensure source is closed even if processing fails
         try {
-          source.getLines().drop(1).foreach { line =>
+          // foldLeft replaces foreach: accumulates Unit, preserving functional style (no loops)
+          source.getLines().drop(1).foldLeft(()) { (_, line) =>
             val parts = line.split(",")
             if (parts.length >= 7) {
               val order = Order(
@@ -146,7 +159,7 @@ object Main {
               val processedOrder = ProcessedOrder(order, discount, finalPrice)
               
               // Used Either Left/Right for error handling
-              saveToDB(processedOrder) match {
+              saveToDB(processedOrder, conn) match {
                 case Left(err) => logger("ERROR", s"Failed to save order ${order.productName}: $err")
                 case Right(_)  => // already logged inside saveToDB
               }
@@ -160,15 +173,18 @@ object Main {
       }.toEither.left.map(_.getMessage)
 
     // Execution trigger
-    val fileName = "src/main/resources/TRX1000.csv" 
-    // Used Either Left/Right for error handling
-    processFile(fileName) match {
-      case Right(_) => logger("INFO", "File processing completed successfully.")
-      case Left(e)  => logger("ERROR", s"Critical failure: $e")
-    }
+    val fileName = "src/main/resources/TRX1000.csv"
 
-    val lineCountAfter: Either[String, Long] =
-      Try(Files.lines(Paths.get("rules_engine.log")).count())
-        .toEither.left.map(_.getMessage)
+    // Initialise DB, process file, then close the connection
+    // Used Either Left/Right for error handling
+    initDB() match {
+      case Left(e)     => logger("ERROR", s"DB initialisation failed: $e")
+      case Right(conn) =>
+        processFile(fileName, conn) match {
+          case Right(_) => logger("INFO", "File processing completed successfully.")
+          case Left(e)  => logger("ERROR", s"Critical failure: $e")
+        }
+        conn.close()
+    }
   }
 }
