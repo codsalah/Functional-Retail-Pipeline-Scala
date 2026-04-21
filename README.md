@@ -285,6 +285,62 @@ CREATE TABLE IF NOT EXISTS processed_orders (
 
 ---
 
+## Testing
+
+### Database Query Tool
+
+A query tool is provided to inspect the processed orders in the SQLite database:
+
+**File:** `src/main/scala/query_db.scala`
+
+**Usage:**
+```bash
+# Query first 10 records (default)
+scala run src/main/scala/query_db.scala
+
+# Query first N records
+scala run src/main/scala/query_db.scala 50
+
+# Execute custom SQL query
+scala run src/main/scala/query_db.scala "SELECT * FROM processed_orders WHERE discount > 0.1"
+```
+
+**Features:**
+- Accepts either a numeric limit or a full SQL query
+- Automatically formats output with aligned columns
+- Handles NULL values gracefully
+- Includes error handling for invalid queries
+
+### Unit Tests
+
+**File:** `src/test/scala/RuleEngineSpec.scala`
+
+Pure function unit tests for the discount rules using munit:
+
+```bash
+scala test src/test/scala/RuleEngineSpec.scala
+```
+
+The test suite verifies:
+- Individual rule calculations (expiry, sale, special date, bulk, quantity step, visa)
+- Top-2 averaging logic for multiple qualifying rules
+- Edge cases (no rules qualify, single rule, multiple rules)
+- Boundary conditions (exactly at thresholds)
+
+---
+
+## To Run The Project
+
+Run the main application:
+```bash
+scala run src/main/scala/retail/*.scala --main-class retail.Main
+```
+
+Run the unit tests:
+```bash
+scala test src/test/scala/RuleEngineSpec.scala src/main/scala/retail/*.scala
+```
+
 ## Design Principles Applied
 
 **Open/Closed Principle** — The engine is open for extension (add new `val` rules) but closed for modification (never touch `calculateDiscount` or `processFile` to add a rule).
