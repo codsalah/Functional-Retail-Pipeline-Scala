@@ -1,5 +1,7 @@
 package retail
 
+// Data Models - FUNCTIONAL CORE
+// Pure immutable data structures with no side effects
 import java.time.{LocalDate, LocalDateTime}
 
 // The Data models

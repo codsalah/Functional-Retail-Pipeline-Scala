@@ -6,12 +6,14 @@ import java.sql.{Connection, DriverManager, PreparedStatement}
 import scala.util.{Try, Success, Failure}
 import scala.io.Source
 
-// The Main Application
+// The Main Application - Imperative Shell
+// This file contains all side effects (I/O, DB, logging) and orchestrates the pure functional core
 object Main {
   def main(args: Array[String]): Unit = {
-    // Here lives the side effects (Impure Functions)
-    
-    // 2. Database Operations (SQLite)
+    // IMPERATIVE SHELL: All side effects live here
+
+    // Database Operations - Pure DB operation logic (returns Either for error handling)
+    // The DB operation itself is a side effect, but the function is pure in terms of its logic
     def saveToDB(po: ProcessedOrder, conn: Connection): Either[String, Unit] =
       Try {
         val sql = "INSERT INTO processed_orders (timestamp, product_name, discount, final_price) VALUES (?, ?, ?, ?)"
@@ -22,9 +24,6 @@ object Main {
         stmt.setDouble(4, po.finalPrice)
         stmt.executeUpdate()
         stmt.close()
-
-        // Use .foreach or a match to execute the side-effect without changing the return type
-        RuleLogger.logger("INFO", s"Successfully saved to ProcessedOrders: ${po.order.productName}")
         () // Return Unit to ensure the type is Either[String, Unit]
       }.toEither.left.map(_.getMessage)
 
@@ -70,10 +69,12 @@ object Main {
               val finalPrice = order.unitPrice * order.quantity * (1 - discount)
               val processedOrder = ProcessedOrder(order, discount, finalPrice)
               
-              // Used Either Left/Right for error handling
+              // Used Either Left/Right for error handling - logging is handled by caller (imperative shell)
               saveToDB(processedOrder, conn) match {
-                case Left(err) => RuleLogger.logger("ERROR", s"Failed to save order ${order.productName}: $err")
-                case Right(_)  => // already logged inside saveToDB
+                case Left(err) =>
+                  RuleLogger.logger("ERROR", s"Failed to save order ${order.productName}: $err")
+                case Right(_) =>
+                  RuleLogger.logger("INFO", s"Successfully saved to ProcessedOrders: ${order.productName}")
               }
             } else {
               RuleLogger.logger("WARN", s"Skipping malformed line: $line") // simple error handling for malformed lines

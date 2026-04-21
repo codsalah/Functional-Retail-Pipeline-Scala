@@ -2,7 +2,8 @@ package retail
 
 import java.time.temporal.ChronoUnit
 
-// The Rule Engine (Pure Functions)
+// The Rule Engine - FUNCTIONAL CORE
+// All functions here are pure: no side effects, no I/O, only data transformation
 object RuleEngine {
   type DiscountRule = Order => Double
   

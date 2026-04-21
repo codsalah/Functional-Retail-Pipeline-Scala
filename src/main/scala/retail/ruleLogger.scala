@@ -1,5 +1,7 @@
 package retail
 
+// Rule Logger - IMPERATIVE SHELL
+// Handles file I/O side effect (logging)
 import java.nio.file.{Files, Paths, StandardOpenOption}
 import java.time.LocalDateTime
 import scala.util.Try
