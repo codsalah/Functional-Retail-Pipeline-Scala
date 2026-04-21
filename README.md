@@ -21,17 +21,33 @@ The entire codebase respects the following FP constraints:
 
 ## Architecture — Separation of Concerns
 
-The project is split into 4 logical layers:
+The project follows the **Functional Core / Imperative Shell** pattern:
 
 ```
 src/main/scala/retail/
-├── dataModel.scala     → Data models (Order, ProcessedOrder)
-├── ruleEngine.scala    → Pure discount rules
-├── ruleLogger.scala    → File logging side effect
-└── Main.scala          → DB, file I/O, execution trigger
+├── dataModel.scala     → FUNCTIONAL CORE: Pure immutable data structures
+├── ruleEngine.scala    → FUNCTIONAL CORE: Pure discount calculation logic
+├── ruleLogger.scala    → IMPERATIVE SHELL: File I/O side effect (logging)
+└── Main.scala          → IMPERATIVE SHELL: DB, file I/O, orchestration
 ```
 
-Each layer has a single responsibility. Adding a new rule never touches `Main.scala`. Adding a new field never touches `RuleEngine`.
+### Functional Core (Pure, Testable)
+- **dataModel.scala**: Immutable case classes with no side effects
+- **ruleEngine.scala**: Pure functions that transform `Order` → `Double` (discount)
+- No I/O, no external state, no side effects
+- Easily testable in isolation (see `RuleEngineSpec.scala`)
+
+### Imperative Shell (Side Effects, Orchestration)
+- **Main.scala**: Database operations, file reading, execution orchestration
+- **ruleLogger.scala**: File writing (logging side effect)
+- Handles all I/O and external interactions
+- Calls the functional core to perform business logic
+
+**Benefits:**
+- The core logic can be tested without I/O dependencies
+- The imperative shell can be swapped or modified independently
+- Clear separation makes the code more maintainable and adaptable
+- Adding a new rule never touches `Main.scala`. Adding a new field never touches `RuleEngine`.
 
 ---
 
