@@ -59,12 +59,26 @@ object RuleEngine {
       case _ => 0.0
     }
   }    
+
+  //Rule: Quantity Step Discount (5 items = 5%, 10 items = 10%, etc.) 
+  val quantityStepRule: DiscountRule = order => {
+    if (order.channel.equalsIgnoreCase("app")) math.min(math.ceil(order.quantity / 5.0), 20.0) * 5.0 / 100.0 
+    else 0.0
+  }
+
+  // Rule: Payment with Visa (5%)
+  val visaRule: DiscountRule = order => {
+    if (order.paymentMethod.equalsIgnoreCase("visa")) 0.05 else 0.0
+  }
+  
   // Vector of all rules 
   val rules: Vector[DiscountRule] = Vector(
     expiryRule,
     saleRule,
     specialDateRule,
-    bulkRule
+    bulkRule,
+    quantityStepRule,
+    visaRule
   )
   
   def calculateDiscount(order: Order): Double = {
