@@ -1,6 +1,7 @@
 target/
 .idea/
 .bsp/
+.metals/
 *.json
 *.class
 *.jar
