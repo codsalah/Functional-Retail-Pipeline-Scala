@@ -35,6 +35,52 @@ Each layer has a single responsibility. Adding a new rule never touches `Main.sc
 
 ---
 
+## End-to-End Execution Sequence
+
+The following sequence diagram illustrates the complete execution flow from initialization through order processing to completion:
+
+```mermaid
+sequenceDiagram
+    participant M  as Main
+    participant DB as initDB / saveToDB
+    participant F  as processFile
+    participant RE as RuleEngine
+    participant RL as RuleLogger
+
+    M  ->> DB: initDB()
+    DB -->> M: Right(conn) or Left(err)
+    M  ->> F:  processFile(filePath, conn)
+    F  ->> F:  Source.fromFile → drop(1) → foldLeft
+    loop each CSV line
+      F  ->> F:  parse parts → Order(...)
+      F  ->> RE: calculateDiscount(order)
+      RE ->> RE: apply 6 rules → filter → sortBy(-_) → take(2)
+      RE -->> F: discount: Double
+      F  ->> F:  finalPrice = unitPrice × qty × (1 − discount)
+      F  ->> F:  ProcessedOrder(order, discount, finalPrice)
+      F  ->> DB: saveToDB(processedOrder, conn)
+      DB ->> RL: logger("INFO", "Saved …")
+      RL -->> DB: Either[String, Unit]
+      DB -->> F: Right(()) or Left(err)
+      alt Left(err)
+        F ->> RL: logger("ERROR", …)
+      end
+    end
+    F  -->> M: Right(()) or Left(err)
+    M  ->> DB: conn.close()
+```
+
+**Key Points:**
+- **Main** orchestrates the entire workflow, starting with database initialization
+- **initDB / saveToDB** handles all SQLite operations with `Either` error handling
+- **processFile** reads the CSV line-by-line using functional iteration (foldLeft)
+- **RuleEngine** is pure — it takes an Order and returns a discount without side effects
+- The discount calculation applies all 6 rules, filters positive values, sorts descending, and averages the top 2
+- **RuleLogger** is the only component that performs I/O (writing to the log file)
+- All error paths use `Either[String, Unit]` for functional error handling
+
+---
+
 ## Data Models
 
 ```scala
@@ -105,6 +151,49 @@ calculateDiscount(order: Order): ℝ =
 - If **no rule** qualifies → 0% discount.
 - If **one rule** qualifies → that discount applies directly.
 - If **multiple rules** qualify → take the **top 2** and **average** them.
+
+### Rule Engine Flow
+
+The following flowchart visualizes the discount calculation pipeline from order input through rule application to final discount:
+
+```mermaid
+flowchart LR
+    ORD(["Order"])
+
+    subgraph RULES["Vector[DiscountRule]"]
+      R1["expiryRule (30−Δt)×0.01"]
+      R2["saleRule: cheese 10% / wine 5%"]
+      R3["specialDateRule: Mar 23 → 50%"]
+      R4["bulkRule: 6+ qty tiers"]
+      R5["quantityStepRule: app channel"]
+      R6["visaRule: Visa 5%"]
+    end
+
+    MAP["map: rule ⇒ rule(order)"]
+    FILT["filter: discard zeros"]
+    SORT["sortBy: descending"]
+    TAKE["take: top two"]
+    AVG{"isEmpty?"}
+    ZERO["0.0"]
+    RESULT["sum / size = final discount"]
+
+    ORD --> R1 & R2 & R3 & R4 & R5 & R6
+    R1 & R2 & R3 & R4 & R5 & R6 --> MAP
+    MAP --> FILT --> SORT --> TAKE --> AVG
+    AVG -->|"yes"| ZERO
+    AVG -->|"no"| RESULT
+```
+
+**Flow Explanation:**
+- **Order** enters the system and is distributed to all 6 rules in parallel
+- Each rule in the **Vector[DiscountRule]** independently calculates its discount
+- **map** applies each rule function to the order, producing a collection of discounts
+- **filter** removes zero-valued discounts (rules that didn't qualify)
+- **sortBy** orders the remaining discounts in descending order
+- **take** extracts only the top 2 highest discounts
+- **isEmpty?** checks if any rules qualified
+- If no rules qualified, returns **0.0** (identity element)
+- Otherwise, calculates the **average** of the top 2 discounts as the final result
 
 ---
 
