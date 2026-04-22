@@ -1,18 +1,18 @@
 # Functional-Retail-Pipeline-Scala
 A flexible, extensible Scala discount calculation pipeline for commercial orders.
 
-A rule-based discount engine for a retail store, built in **pure functional Scala**. The engine reads transaction CSV data, evaluates each order against a set of discount rules, calculates the final price, and persists results to a SQLite database — all while logging every event to a file.
+A rule-based discount engine for a retail store, built in **pure functional Scala**. The engine reads transaction CSV data, evaluates each order against a set of discount rules, calculates the final price, and persists results to a PostgreSQL database — all while logging every event to a file.
 
 
 ## Functional Programming Constraints
 
-The entire codebase respects the following FP constraints:
+The entire codebase respects the following FP constraints in the **functional core**:
 
 | Constraint | How it's enforced |
 |---|---|
-| No `var` | Only `val` used throughout |
+| No `var` | Only `val` used in the functional core; imperative shell isolates necessary mutation |
 | No mutable data structures | `Vector` for rules, case classes for data |
-| No loops | `foldLeft` / `foreach` / `map` / `filter` replaces all iteration |
+| No loops | `parEvalMapUnordered` / `map` / `filter` replaces all iteration |
 | Pure functions | `RuleEngine` has zero side effects |
 | Total functions | Every function returns a value for every possible input |
 | Error handling | `Either[String, Unit]` via `.toEither.left.map(_.getMessage)` |
@@ -28,7 +28,9 @@ src/main/scala/retail/
 ├── dataModel.scala     → FUNCTIONAL CORE: Pure immutable data structures
 ├── ruleEngine.scala    → FUNCTIONAL CORE: Pure discount calculation logic
 ├── ruleLogger.scala    → IMPERATIVE SHELL: File I/O side effect (logging)
-└── Main.scala          → IMPERATIVE SHELL: DB, file I/O, orchestration
+├── Main.scala          → IMPERATIVE SHELL: DB, file I/O, orchestration
+├── SimpleQuery.scala   → UTILITY: Plain JDBC query tool for DB inspection
+└── TestTruncate.scala  → UTILITY: Table truncation utility via Doobie
 ```
 
 ### Functional Core (Pure, Testable)
@@ -58,41 +60,42 @@ The following sequence diagram illustrates the complete execution flow from init
 ```mermaid
 sequenceDiagram
     participant M  as Main
-    participant DB as initDB / saveToDB
-    participant F  as processFile
+    participant DB as Doobie / PostgreSQL
+    participant S  as fs2 Stream
     participant RE as RuleEngine
     participant RL as RuleLogger
 
-    M  ->> DB: initDB()
-    DB -->> M: Right(conn) or Left(err)
-    M  ->> F:  processFile(filePath, conn)
-    F  ->> F:  Source.fromFile → drop(1) → foldLeft
-    loop each CSV line
-      F  ->> F:  parse parts → Order(...)
-      F  ->> RE: calculateDiscount(order)
-      RE ->> RE: apply 6 rules → filter → sortBy(-_) → take(2)
-      RE -->> F: discount: Double
-      F  ->> F:  finalPrice = unitPrice × qty × (1 − discount)
-      F  ->> F:  ProcessedOrder(order, discount, finalPrice)
-      F  ->> DB: saveToDB(processedOrder, conn)
-      DB ->> RL: logger("INFO", "Saved …")
-      RL -->> DB: Either[String, Unit]
-      DB -->> F: Right(()) or Left(err)
-      alt Left(err)
-        F ->> RL: logger("ERROR", …)
-      end
+    M  ->> DB: initDB() — CREATE TABLE IF NOT EXISTS
+    DB -->> M: IO[Unit]
+    M  ->> S:  readLinesStream(path) — fs2 byte stream → UTF-8 lines
+    S  ->> S:  chunkN(20000) → parEvalMapUnordered(nCPUs)
+    loop each chunk (parallel across CPU cores)
+      S  ->> S:  parse CSV parts → Order(...)
+      S  ->> RE: calculateDiscount(order)
+      RE ->> RE: apply 6 rules → filter → sortBy(-_) → take(2) → average
+      RE -->> S: discount: Double
+      S  ->> S:  finalPrice = unitPrice × qty × (1 − discount)
+      S  ->> S:  ProcessedOrder(order, discount, finalPrice)
     end
-    F  -->> M: Right(()) or Left(err)
-    M  ->> DB: conn.close()
+    S  ->> M:  Stream[IO, List[ProcessedOrder]] (batches)
+    M  ->> M:  parEvalMapUnordered(writeParallelism)
+    loop each batch (parallel DB writes)
+      M  ->> DB: Update[(String,String,Double,Double)].updateMany(rows).transact(xa)
+      DB -->> M: IO[Unit]
+      M  ->> RL: logger("INFO", "Batch of N orders committed")
+      RL -->> M: Either[String, Unit]
+    end
+    M  -->> M: onFinalize → logger.info("Processing Completed")
 ```
 
 **Key Points:**
 - **Main** orchestrates the entire workflow, starting with database initialization
-- **initDB / saveToDB** handles all SQLite operations with `Either` error handling
-- **processFile** reads the CSV line-by-line using functional iteration (foldLeft)
+- **readLinesStream** reads the CSV as a constant-memory fs2 byte stream decoded to UTF-8 lines
+- **chunkN + parEvalMapUnordered** distributes chunk processing across all available CPU cores
 - **RuleEngine** is pure — it takes an Order and returns a discount without side effects
 - The discount calculation applies all 6 rules, filters positive values, sorts descending, and averages the top 2
-- **RuleLogger** is the only component that performs I/O (writing to the log file)
+- **saveBatchToDb** uses Doobie's `updateMany` for efficient batch inserts, each chunk in its own transaction
+- **RuleLogger** is the only component that performs file I/O (writing to the log file)
 - All error paths use `Either[String, Unit]` for functional error handling
 
 ---
@@ -371,13 +374,13 @@ Try { ... }.toEither.left.map(_.getMessage)
 - `Right(())` → success
 - `Left(errorMessage)` → failure with descriptive string
 
-This pattern is used consistently in `logger`, `saveToDB`, `initDB`, and `processFile`, making every failure path explicit and type-safe with no unsafe `.get` calls anywhere.
+This pattern is used consistently in `logger`, `saveBatchToDb`, `initDB`, and the stream pipeline, making every failure path explicit and type-safe with no unsafe `.get` calls anywhere.
 
 ---
 
 ## Database
 
-SQLite via `org.xerial:sqlite-jdbc`. The table is created on first run:
+PostgreSQL 16 via Docker, accessed through **Doobie** (functional JDBC wrapper for Cats Effect). The table is created on first run:
 
 ```sql
 CREATE TABLE IF NOT EXISTS processed_orders (
@@ -388,33 +391,41 @@ CREATE TABLE IF NOT EXISTS processed_orders (
 )
 ```
 
+Batch inserts use Doobie's `Update[...].updateMany(rows)` with `reWriteBatchedInserts=true` on the JDBC URL for maximum PostgreSQL throughput.
+
 ---
 
 ## Testing
 
 ### Database Query Tool
 
-A query tool is provided to inspect the processed orders in the SQLite database:
+A plain JDBC query tool is provided to inspect the processed orders in the PostgreSQL database:
 
-**File:** `src/main/scala/query_db.scala`
+**File:** `src/main/scala/retail/SimpleQuery.scala`
 
 **Usage:**
 ```bash
-# Query first 10 records (default)
-scala run src/main/scala/query_db.scala
+# Count all records
+~/.local/share/coursier/bin/sbt "runMain retail.SimpleQuery"
 
-# Query first N records
-scala run src/main/scala/query_db.scala 50
-
-# Execute custom SQL query
-scala run src/main/scala/query_db.scala "SELECT * FROM processed_orders WHERE discount > 0.1"
+# Show last N records (ordered by timestamp DESC)
+~/.local/share/coursier/bin/sbt "runMain retail.SimpleQuery show 100"
 ```
 
 **Features:**
-- Accepts either a numeric limit or a full SQL query
-- Automatically formats output with aligned columns
-- Handles NULL values gracefully
-- Includes error handling for invalid queries
+- Count mode: returns total row count from `processed_orders`
+- Show mode: prints the last N records formatted in aligned columns
+- Handles connection lifecycle safely with `try/finally`
+
+### Table Truncation Utility
+
+**File:** `src/main/scala/retail/TestTruncate.scala`
+
+Truncates `processed_orders` and logs before/after row counts — useful for re-running the pipeline on a clean slate:
+
+```bash
+~/.local/share/coursier/bin/sbt "runMain retail.TestTruncate"
+```
 
 ### Unit Tests
 
@@ -423,7 +434,7 @@ scala run src/main/scala/query_db.scala "SELECT * FROM processed_orders WHERE di
 Pure function unit tests for the discount rules using munit:
 
 ```bash
-scala test src/test/scala/RuleEngineSpec.scala
+~/.local/share/coursier/bin/sbt test
 ```
 
 The test suite verifies:
@@ -436,21 +447,63 @@ The test suite verifies:
 
 ## To Run The Project
 
-Run the main application:
+### Prerequisites
+- Docker and Docker Compose installed
+- Scala 2.13+ (automatically handled by sbt)
+- PostgreSQL (handled by Docker Compose)
+
+### Quick Start
+
+1. **Start PostgreSQL and Adminer or any other client database tool**
 ```bash
-scala run src/main/scala/retail/*.scala --main-class retail.Main
+docker compose up -d
+```
+This starts two services:
+- `orders_postgres` — PostgreSQL 16 on port `5432`
+- `orders_adminer` — Adminer web UI on port `8080`
+
+2. **Run the Main Application (Parallel Processing)**
+```bash
+~/.local/share/coursier/bin/sbt run
+```
+This will process 10 million records with parallel streaming and batch inserts.
+
+3. **Query the Database**
+```bash
+# Count all records
+~/.local/share/coursier/bin/sbt "runMain retail.SimpleQuery"
+
+# Show last N records
+~/.local/share/coursier/bin/sbt "runMain retail.SimpleQuery show 100"
 ```
 
-Run the unit tests:
+### Database Access
+
+**Web Interface:** Adminer at `http://localhost:8080`
+- Server: `postgres` (or `localhost` from host machine)
+- Username: `docker`
+- Password: `docker`
+- Database: `ordersdb`
+
+**Command Line:** Use `SimpleQuery` or any standard PostgreSQL client pointed at `localhost:5432`
+
+### Performance Features
+- **Parallel Processing**: Uses all available CPU cores
+- **Streaming**: Constant memory usage regardless of file size
+- **Batch Inserts**: Optimized database writes (20,000 records per batch)
+- **PostgreSQL**: High-performance concurrent database operations
+
+### Run Unit Tests
 ```bash
-scala test src/test/scala/RuleEngineSpec.scala src/main/scala/retail/*.scala
+~/.local/share/coursier/bin/sbt test
 ```
 
 ## Design Principles Applied
 
-**Open/Closed Principle** — The engine is open for extension (add new `val` rules) but closed for modification (never touch `calculateDiscount` or `processFile` to add a rule).
+**Open/Closed Principle** — The engine is open for extension (add new `val` rules) but closed for modification (never touch `calculateDiscount` or the streaming pipeline to add a rule).
 
 **Pure Core, Impure Shell** — `RuleEngine` is 100% pure with no side effects. All I/O (logging, DB, file reading) lives in `Main` and is clearly marked as impure.
 
-
 **Pluggable Rule Pool** — `type DiscountRule = Order => Double` means any new business rule is just a new function. The `Vector` accumulates them. The averaging logic is universal.
+
+**Constant-Memory Streaming** — fs2 `Stream` ensures memory usage stays flat regardless of input file size, processing 10M+ rows without loading the dataset into memory.
