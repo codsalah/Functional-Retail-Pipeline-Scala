@@ -3,6 +3,7 @@ A flexible, extensible Scala discount calculation pipeline for commercial orders
 
 A rule-based discount engine for a retail store, built in **pure functional Scala**. The engine reads transaction CSV data, evaluates each order against a set of discount rules, calculates the final price, and persists results to a PostgreSQL database — all while logging every event to a file.
 
+![alt text](Imgs/overview.png)
 
 ## Functional Programming Constraints
 
@@ -51,42 +52,33 @@ src/main/scala/retail/
 - Clear separation makes the code more maintainable and adaptable
 - Adding a new rule never touches `Main.scala`. Adding a new field never touches `RuleEngine`.
 
+
+### Parallelism Architecture
+
+The system achieves maximum throughput through strategic parallelization at multiple levels:
+
+![Parallelism Architecture](Imgs/prallelism.png)
+
+**Parallel Processing Levels:**
+
+1. **CPU-Level Parallelism**: `parEvalMapUnordered(nCPUs)` distributes chunk processing across all available CPU cores
+2. **Database-Level Parallelism**: `parEvalMapUnordered(writeParallelism)` enables concurrent batch writes to PostgreSQL
+3. **Stream-Level Parallelism**: fs2 streams enable backpressure-aware processing without blocking
+
+**Benefits:**
+- **Scalability**: Automatically utilizes all available CPU cores
+- **Throughput**: Concurrent database writes prevent I/O bottlenecks
+- **Memory Efficiency**: Constant memory footprint regardless of dataset size
+- **Resource Utilization**: Maximizes both CPU and database connection pool usage
+
+
 ---
 
 ## End-to-End Execution Sequence
 
 The following sequence diagram illustrates the complete execution flow from initialization through order processing to completion:
 
-```mermaid
-sequenceDiagram
-    participant M  as Main
-    participant DB as Doobie / PostgreSQL
-    participant S  as fs2 Stream
-    participant RE as RuleEngine
-    participant RL as RuleLogger
-
-    M  ->> DB: initDB() — CREATE TABLE IF NOT EXISTS
-    DB -->> M: IO[Unit]
-    M  ->> S:  readLinesStream(path) — fs2 byte stream → UTF-8 lines
-    S  ->> S:  chunkN(20000) → parEvalMapUnordered(nCPUs)
-    loop each chunk (parallel across CPU cores)
-      S  ->> S:  parse CSV parts → Order(...)
-      S  ->> RE: calculateDiscount(order)
-      RE ->> RE: apply 6 rules → filter → sortBy(-_) → take(2) → average
-      RE -->> S: discount: Double
-      S  ->> S:  finalPrice = unitPrice × qty × (1 − discount)
-      S  ->> S:  ProcessedOrder(order, discount, finalPrice)
-    end
-    S  ->> M:  Stream[IO, List[ProcessedOrder]] (batches)
-    M  ->> M:  parEvalMapUnordered(writeParallelism)
-    loop each batch (parallel DB writes)
-      M  ->> DB: Update[(String,String,Double,Double)].updateMany(rows).transact(xa)
-      DB -->> M: IO[Unit]
-      M  ->> RL: logger("INFO", "Batch of N orders committed")
-      RL -->> M: Either[String, Unit]
-    end
-    M  -->> M: onFinalize → logger.info("Processing Completed")
-```
+![alt text](Imgs/sequenceDiagram.png)
 
 **Key Points:**
 - **Main** orchestrates the entire workflow, starting with database initialization
@@ -175,33 +167,7 @@ calculateDiscount(order: Order): ℝ =
 
 The following flowchart visualizes the discount calculation pipeline from order input through rule application to final discount:
 
-```mermaid
-flowchart LR
-    ORD(["Order"])
-
-    subgraph RULES["Vector[DiscountRule]"]
-      R1["expiryRule (30−Δt)×0.01"]
-      R2["saleRule: cheese 10% / wine 5%"]
-      R3["specialDateRule: Mar 23 → 50%"]
-      R4["bulkRule: 6+ qty tiers"]
-      R5["quantityStepRule: app channel"]
-      R6["visaRule: Visa 5%"]
-    end
-
-    MAP["map: rule ⇒ rule(order)"]
-    FILT["filter: discard zeros"]
-    SORT["sortBy: descending"]
-    TAKE["take: top two"]
-    AVG{"isEmpty?"}
-    ZERO["0.0"]
-    RESULT["sum / size = final discount"]
-
-    ORD --> R1 & R2 & R3 & R4 & R5 & R6
-    R1 & R2 & R3 & R4 & R5 & R6 --> MAP
-    MAP --> FILT --> SORT --> TAKE --> AVG
-    AVG -->|"yes"| ZERO
-    AVG -->|"no"| RESULT
-```
+![alt text](Imgs/ruleEngine.png)
 
 **Flow Explanation:**
 - **Order** enters the system and is distributed to all 6 rules in parallel
