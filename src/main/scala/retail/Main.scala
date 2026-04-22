@@ -1,62 +1,65 @@
-//> using dep org.xerial:sqlite-jdbc:3.53.0.0
 package retail
 
-import java.time.{LocalDate, LocalDateTime}
-import java.sql.{Connection, DriverManager, PreparedStatement}
-import scala.util.{Try, Success, Failure}
-import scala.io.Source
+import cats.effect.{ExitCode, IO, IOApp}
+import doobie.Transactor
+import doobie.implicits._
+import doobie.postgres.implicits._
+import doobie.util.update.Update
+import fs2.{Stream, text}
+import fs2.io.file.{Files}
+import org.typelevel.log4cats.Logger
+import org.typelevel.log4cats.slf4j.Slf4jLogger
+import java.nio.file.Paths
+import java.time.LocalDate
 
-// The Main Application - Imperative Shell
-// This file contains all side effects (I/O, DB, logging) and orchestrates the pure functional core
-object Main {
-  def main(args: Array[String]): Unit = {
-    // IMPERATIVE SHELL: All side effects live here
+object Main extends IOApp {
 
-    // Database Operations - Pure DB operation logic (returns Either for error handling)
-    // The DB operation itself is a side effect, but the function is pure in terms of its logic
-    def saveToDB(po: ProcessedOrder, conn: Connection): Either[String, Unit] =
-      Try {
-        val sql = "INSERT INTO processed_orders (timestamp, product_name, discount, final_price) VALUES (?, ?, ?, ?)"
-        val stmt: PreparedStatement = conn.prepareStatement(sql)
-        stmt.setString(1, po.processedAt.toString)
-        stmt.setString(2, po.order.productName)
-        stmt.setDouble(3, po.discount)
-        stmt.setDouble(4, po.finalPrice)
-        stmt.executeUpdate()
-        stmt.close()
-        () // Return Unit to ensure the type is Either[String, Unit]
-      }.toEither.left.map(_.getMessage)
+  // Logger (implicit for dependency injection)
+  implicit def logger: Logger[IO] = Slf4jLogger.getLogger[IO]
 
-    // Helper to initialise the DB and create the table if it doesn't exist
-    def initDB(): Either[String, Connection] =
-      Try {
-        val conn = DriverManager.getConnection("jdbc:sqlite:processed_orders.db")
-        val stmt = conn.createStatement()
-        stmt.execute(
-          """CREATE TABLE IF NOT EXISTS processed_orders (
-            |  timestamp    TEXT,
-            |  product_name TEXT,
-            |  discount     REAL,
-            |  final_price  REAL
-            |)""".stripMargin
-        )
-        stmt.close()
-        conn
-      }.toEither.left.map(_.getMessage)
-          
-    // 3. File I/O (Read CSV, Process)
-    def processFile(filePath: String, conn: Connection): Either[String, Unit] =
-      Try {
-        val source = Source.fromFile(filePath)
-        
-        // Ensure source is closed even if processing fails
-        try {
-          // foldLeft replaces foreach: accumulates Unit, preserving functional style (no loops)
-          source.getLines().drop(1).foldLeft(()) { (_, line) =>
+  // Database transactor - single connection managed by Doobie
+  def createTransactor: Transactor[IO] = 
+    Transactor.fromDriverManager[IO](
+      "org.postgresql.Driver", 
+      "jdbc:postgresql://localhost:5432/ordersdb?reWriteBatchedInserts=true", 
+      "docker", 
+      "docker", 
+      None
+    )
+
+  // Initialize database table (IO effect)
+  def initDB(xa: Transactor[IO]): IO[Unit] = {
+    val createTable = sql"""
+      CREATE TABLE IF NOT EXISTS processed_orders (
+        timestamp    TEXT,
+        product_name TEXT,
+        discount     REAL,
+        final_price  REAL
+      )
+    """.update.run
+
+    createTable.transact(xa).void
+  }
+
+  // Reads CSV file as a stream of lines, skipping header and empty lines. 
+  // Uses fs2 streaming to keep memory usage constant.
+  def readLinesStream(path: String): Stream[IO, String] =
+    Files[IO].readAll(Paths.get(path), chunkSize = 64 * 1024)
+      .through(text.utf8.decode)
+      .through(text.lines)
+      .filter(_.trim.nonEmpty)
+      .drop(1) // Skip CSV header
+
+  // Transforms stream of CSV lines into stream of processed order batches. 
+  // Uses parallel evaluation on all available CPU cores.
+  def processOrdersStream(lines: Stream[IO, String], chunkSize: Int): Stream[IO, List[ProcessedOrder]] =
+    lines.chunkN(chunkSize)
+      .parEvalMapUnordered(Runtime.getRuntime.availableProcessors()) { chunk =>
+        IO {
+          chunk.toList.flatMap { line =>
             val parts = line.split(",")
             if (parts.length >= 7) {
               val order = Order(
-                // Extracting date from timestamp (e.g., 2023-04-18)
                 transactionDate = LocalDate.parse(parts(0).substring(0, 10)),
                 productName     = parts(1),
                 expiryDate      = LocalDate.parse(parts(2)),
@@ -64,40 +67,61 @@ object Main {
                 unitPrice       = parts(4).toDouble,
                 channel         = parts(5),
                 paymentMethod   = parts(6)
-              ) 
+              )
               val discount = RuleEngine.calculateDiscount(order)
               val finalPrice = order.unitPrice * order.quantity * (1 - discount)
-              val processedOrder = ProcessedOrder(order, discount, finalPrice)
-              
-              // Used Either Left/Right for error handling - logging is handled by caller (imperative shell)
-              saveToDB(processedOrder, conn) match {
-                case Left(err) =>
-                  RuleLogger.logger("ERROR", s"Failed to save order ${order.productName}: $err")
-                case Right(_) =>
-                  RuleLogger.logger("INFO", s"Successfully saved to ProcessedOrders: ${order.productName}")
-              }
+              Some(ProcessedOrder(order, discount, finalPrice))
             } else {
-              RuleLogger.logger("WARN", s"Skipping malformed line: $line") // simple error handling for malformed lines
+              RuleLogger.logger("WARN", s"Skipping malformed line: $line")
+              None
             }
           }
-        } finally {
-          source.close()
         }
-      }.toEither.left.map(_.getMessage)
+      }
 
-    // Execution trigger
-    val fileName = "src/main/resources/TRX1000.csv"
+  // Inserts a batch of processed orders into the database. Each batch is processed in its own transaction.
+  // IO effect for database operations.
+  def saveBatchToDb(batch: List[ProcessedOrder], xa: Transactor[IO]): IO[Unit] = {
+    val sql = """
+      INSERT INTO processed_orders (timestamp, product_name, discount, final_price)
+      VALUES (?, ?, ?, ?)
+    """
+    
+    // Map to flat tuple for doobie Write type derivation (String, String, Double, Double)
+    val rows = batch.map(po => (
+      po.processedAt.toString,
+      po.order.productName,
+      po.discount,
+      po.finalPrice
+    ))
 
-    // Initialise DB, process file, then close the connection
-    // Used Either Left/Right for error handling
-    initDB() match {
-      case Left(e)     => RuleLogger.logger("ERROR", s"DB initialisation failed: $e")
-      case Right(conn) =>
-        processFile(fileName, conn) match {
-          case Right(_) => RuleLogger.logger("INFO", "File processing completed successfully.")
-          case Left(e)  => RuleLogger.logger("ERROR", s"Critical failure: $e")
-        }
-        conn.close()
-    }
+    (Update[(String, String, Double, Double)](sql).updateMany(rows).transact(xa).void >>
+      logger.info(s"Batch of ${batch.size} orders committed") >>
+      IO { RuleLogger.logger("INFO", s"Batch of ${batch.size} orders committed") })
+  }
+
+  // Complete processing pipeline combining streaming, parallel processing, and database writes.
+  def pipeline(xa: Transactor[IO], path: String, chunkSize: Int, writeParallelism: Int): IO[Unit] =
+    (Stream.eval(logger.info("--- Processing Started ---")) >>
+      processOrdersStream(readLinesStream(path), chunkSize)
+        .parEvalMapUnordered(writeParallelism)(batch => saveBatchToDb(batch, xa))
+        .onFinalize(logger.info("--- Processing Completed Successfully ---"))
+    ).compile.drain
+
+  override def run(args: List[String]): IO[ExitCode] = {
+    val xa = createTransactor
+    
+    val program = for {
+      _   <- initDB(xa)
+      _   <- logger.info("Database initialized successfully")
+      _   <- IO { RuleLogger.logger("INFO", "Pipeline started") }
+      _   <- pipeline(xa, "src/main/resources/TRX10M.csv", 20000, 12)
+      _   <- logger.info("Pipeline execution completed")
+      _   <- IO { RuleLogger.logger("INFO", "Pipeline completed successfully") }
+    } yield ExitCode.Success
+
+    program.handleErrorWith(err => 
+      logger.error(s"Fatal error: ${err.getMessage}").as(ExitCode.Error)
+    )
   }
 }
